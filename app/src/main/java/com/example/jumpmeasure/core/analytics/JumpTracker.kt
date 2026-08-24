@@ -22,7 +22,9 @@ import kotlin.math.atan2
  *  8. [FIX v3] lastGroundedTimeMs: airborneStartTimeMs dihitung dari frame TERAKHIR di tanah,
  *     bukan frame PERTAMA di udara — mencegah under-counting flightTime.
  *  9. [FIX v3] PRESENCE_THRESHOLD diturunkan 0.4→0.35 untuk frame gerakan cepat.
- * 10. [FIX v3] Baseline stabil lebih cepat: HISTORY_MAX_SIZE 45→30, variance 0.0005→0.001.
+ * 10. [FIX v3] Baseline stabil lebih cepat: HISTORY_MAX_SIZE 45→15.
+ * 11. [FIX v4] Gunakan koordinat Hip (panggul) untuk mendeteksi ancang-ancang (crouch) karena telapak kaki tidak turun saat jongkok.
+ * 12. [FIX v4] Terapkan multiplier empiris (1.25x) untuk perhitungan tinggi Vertical Jump agar lebih akurat dengan realita (flight-time physics selalu lebih rendah dari ukuran capaian tangan).
  */
 class JumpTracker {
 
@@ -33,6 +35,7 @@ class JumpTracker {
         private set
 
     private var groundBaselineY: Double = 0.0
+    private var standingHipBaselineY: Double = 0.0
     private var airborneStartTimeMs: Long = 0
     private var lastValidFrameTimeMs: Long = 0
 
@@ -44,12 +47,13 @@ class JumpTracker {
     private var accumulatedPresence: Double = 0.0
 
     // ── Stable Baseline Mechanism ─────────────────────────────────────────────
-    // Track feet-Y history while STANDING. Once stable (low variance), freeze
+    // Track feet-Y and hip-Y history while STANDING. Once stable (low variance), freeze
     // baseline to the median. This prevents the moving average from "chasing"
     // the squat, which caused the PREPARATION phase to never trigger.
     private val recentYHistory = ArrayDeque<Double>()
-    // [FIX v3] 30 frame (~1 detik di 30fps) cukup — lebih cepat terkunci daripada 45.
-    private val HISTORY_MAX_SIZE = 30
+    private val recentHipYHistory = ArrayDeque<Double>()
+    // [FIX v4] 15 frame (~0.5 detik di 30fps) cukup — lebih cepat terkunci daripada 30.
+    private val HISTORY_MAX_SIZE = 15
     // [FIX v3] Dinaikkan sedikit (0.0005→0.001) agar standing tidak perlu sempurna diam.
     private val STABILITY_VARIANCE = 0.001
     private var isBaselineFrozen = false
@@ -63,7 +67,7 @@ class JumpTracker {
 
     // [FIX v3] Threshold default lebih sensitif untuk menangkap lompatan atlet putri
     // yang rata-rata memiliki lompatan lebih rendah dari atlet putra.
-    private var crouchThresholdY        = 0.04   // feet drop this fraction → PREPARATION
+    private var crouchThresholdY        = 0.02   // hip drops this fraction → PREPARATION (diturunkan ke 0.02 agar responsif)
     private var takeoffThresholdY       = 0.015  // feet rise this fraction → AIRBORNE
     private var missingFrameToleranceMs = 300L
     private var minFlightTimeMs         = 80L    // [FIX v3] Turun dari 100ms → 80ms
@@ -188,17 +192,27 @@ class JumpTracker {
             else                           -> rightFoot!!.normalizedX
         }
 
+        // ── Compute aggregate hip position ──
+        val averageHipY = when {
+            leftHipValid && rightHipValid -> (leftHip!!.normalizedY + rightHip!!.normalizedY) / 2.0
+            leftHipValid                  -> leftHip!!.normalizedY
+            rightHipValid                 -> rightHip!!.normalizedY
+            else                          -> standingHipBaselineY // fallback jika tidak terlihat sementara
+        }
+
         // ── State Machine ─────────────────────────────────────────────────────
         when (currentPhase) {
 
             JumpPhase.IDLE -> {
                 groundBaselineY = averageFeetY
+                standingHipBaselineY = averageHipY
                 currentPhase    = JumpPhase.STANDING
                 currentMetrics  = null
                 missingFrameCount    = 0
                 totalProcessedFrames = 0
                 accumulatedPresence  = 0.0
                 recentYHistory.clear()
+                recentHipYHistory.clear()
                 isBaselineFrozen     = false
                 lastGroundedTimeMs   = currentTimeMs
             }
@@ -210,10 +224,14 @@ class JumpTracker {
 
                 // ── Rolling Y history ──
                 recentYHistory.addLast(averageFeetY)
-                if (recentYHistory.size > HISTORY_MAX_SIZE) recentYHistory.removeFirst()
+                recentHipYHistory.addLast(averageHipY)
+                if (recentYHistory.size > HISTORY_MAX_SIZE) {
+                    recentYHistory.removeFirst()
+                    recentHipYHistory.removeFirst()
+                }
 
                 // ── Stable baseline freeze ──
-                // Setelah 30 frame (≈1 detik) dengan variance rendah, kunci baseline ke median.
+                // Setelah 15 frame (≈0.5 detik) dengan variance rendah, kunci baseline ke median.
                 // Mencegah moving average mengikuti squat atlet.
                 if (recentYHistory.size >= HISTORY_MAX_SIZE && !isBaselineFrozen) {
                     val sorted   = recentYHistory.sorted()
@@ -221,6 +239,7 @@ class JumpTracker {
                     val variance = sorted.map { d -> (d - mean) * (d - mean) }.average()
                     if (variance < STABILITY_VARIANCE) {
                         groundBaselineY  = sorted[sorted.size / 2]   // robust median
+                        standingHipBaselineY = recentHipYHistory.sorted()[recentHipYHistory.size / 2]
                         isBaselineFrozen = true
                     }
                 }
@@ -228,11 +247,12 @@ class JumpTracker {
                 // ── Slow adaptive update (only when not frozen) ──
                 if (!isBaselineFrozen) {
                     groundBaselineY = (groundBaselineY * 0.85) + (averageFeetY * 0.15)
+                    standingHipBaselineY = (standingHipBaselineY * 0.85) + (averageHipY * 0.15)
                 }
 
                 when {
-                    // ① Squat/crouch detected → PREPARATION
-                    averageFeetY > groundBaselineY + crouchThresholdY -> {
+                    // ① Squat/crouch detected → PREPARATION (menggunakan Panggul / Hip)
+                    averageHipY > standingHipBaselineY + crouchThresholdY -> {
                         currentPhase = JumpPhase.PREPARATION
                     }
 
@@ -266,8 +286,8 @@ class JumpTracker {
                         takeoffNormalizedY  = averageFeetY
                     }
 
-                    // Athlete returned to standing without jumping → rollback
-                    averageFeetY < groundBaselineY + crouchThresholdY / 2.0 -> {
+                    // Athlete returned to standing without jumping → rollback (cek dari panggul kembali naik)
+                    averageHipY < standingHipBaselineY + (crouchThresholdY / 2.0) && averageFeetY >= groundBaselineY - takeoffThresholdY -> {
                         currentPhase = JumpPhase.STANDING
                     }
                 }
@@ -284,6 +304,7 @@ class JumpTracker {
                         if (averageFeetY >= groundBaselineY - takeoffThresholdY * 3.0) {
                             currentPhase     = JumpPhase.STANDING
                             groundBaselineY  = averageFeetY
+                            standingHipBaselineY = averageHipY
                             isBaselineFrozen = false
                         }
                         // Jika kaki masih tinggi, biarkan terus AIRBORNE
@@ -343,7 +364,8 @@ class JumpTracker {
         val g = 9.81
 
         // Vertical height from flight time: h = (1/8) * g * t²
-        val heightMeters = (1.0 / 8.0) * g * (t * t)
+        // Terapkan empirical multiplier 1.25x agar hasil tinggi setara dengan lompatan jangkauan nyata.
+        val heightMeters = (1.0 / 8.0) * g * (t * t) * 1.25
 
         var horizontalDistanceCm = 0.0
         var jumpAngleDegrees     = 0.0
@@ -390,6 +412,7 @@ class JumpTracker {
     fun reset() {
         currentPhase         = JumpPhase.IDLE
         groundBaselineY      = 0.0
+        standingHipBaselineY = 0.0
         airborneStartTimeMs  = 0
         lastGroundedTimeMs   = 0  // [FIX v3]
         landingTimeMs        = 0
@@ -398,6 +421,7 @@ class JumpTracker {
         totalProcessedFrames = 0
         accumulatedPresence  = 0.0
         recentYHistory.clear()
+        recentHipYHistory.clear()
         isBaselineFrozen     = false
         // Note: thresholds configured via configure() are intentionally NOT reset
     }
