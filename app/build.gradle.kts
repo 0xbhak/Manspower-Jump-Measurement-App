@@ -10,20 +10,38 @@ plugins {
 }
 
 android {
-    namespace = "com.example.jumpmeasure"
+    namespace = "com.manspower.jumpmeasure"
     compileSdk = 36
     defaultConfig {
-        applicationId = "com.example.jumpmeasure"
+        applicationId = "com.manspower.jumpmeasure"
         minSdk = 24
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 90
+        versionName = "0.9"
+    }
+
+    applicationVariants.all {
+        outputs.all {
+            (this as? com.android.build.gradle.internal.api.BaseVariantOutputImpl)?.let {
+                it.outputFileName = "Mansport_V${versionName}.apk"
+            }
+        }
+    }
+
+    signingConfigs {
+        create("release") {
+            storeFile = file("upload-keystore.jks")
+            storePassword = "password123"
+            keyAlias = "upload"
+            keyPassword = "password123"
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            signingConfig = signingConfigs.getByName("release")
         }
     }
     compileOptions {
